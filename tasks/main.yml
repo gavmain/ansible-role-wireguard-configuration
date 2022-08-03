@@ -1,0 +1,81 @@
+---
+# tasks file for wireguard-configuration
+# Sensitive data has already been pre-populated in SSM Parmeter store
+# The EC2 instance will require 'tags in instance metadata' and the endpoint set as a tag {key: "wireguard_endpoint", value: "london.example.com"}
+- name: Gather EC2 facts
+  amazon.aws.ec2_metadata_facts:
+
+- name: Get Region Fact
+  set_fact:
+    wg_region: "{{ ansible_ec2_placement_availability_zone | regex_replace('.$') }}"
+
+- name: Get Endpoint Address
+  set_fact:
+    wg_address: "{{ lookup('aws_ssm', ssm_root_path~'/'~ansible_ec2_tags_instance_wireguard_endpoint~'/address', region=wg_region ) }}"
+
+- name: Get Endpoint Private Key
+  set_fact:
+    wg_prikey: "{{ lookup('aws_ssm', ssm_root_path~'/'~ansible_ec2_tags_instance_wireguard_endpoint~'/prikey', region=wg_region ) }}"
+
+- name: Get Endpoint Pre-shared Key
+  set_fact:
+    wg_psk: "{{ lookup('aws_ssm', ssm_root_path~'/'~ansible_ec2_tags_instance_wireguard_endpoint~'/psk', region=wg_region ) }}"
+
+- name: Get Peers
+  set_fact:
+    wg_peers: "{{ lookup('aws_ssm', ssm_root_path~'/'~ansible_ec2_tags_instance_wireguard_endpoint~'/peers', region=wg_region, bypath=true, recursive=true ) | dict2items }}"
+
+- name: Set Pre-shared Key
+  ansible.builtin.copy:
+    dest: /etc/wireguard/wg.psk
+    content: "{{ lookup('aws_ssm', ssm_root_path~'/'~ansible_ec2_tags_instance_wireguard_endpoint~'/prikey', region=wg_region ) }}\n"
+    owner: root
+    group: root
+    mode: '0600'
+
+- name: Create Wireguard config file
+  ansible.builtin.template:
+    src: templates/wg0.conf.j2
+    dest: /etc/wireguard/wg0.conf
+    owner: root
+    group: root
+    mode: '0600'
+  notify:
+    - Restart Wireguard
+
+- name: Start Wireguard
+  ansible.builtin.systemd:
+    enabled: yes
+    state: started
+    name: wg-quick@wg0.service
+  register: wg_service_status
+
+# Only run the following commands once the service has started
+- name: Wireguard Peers
+  block:
+    - name: Get Local Peers
+      ansible.builtin.command:
+        argv:
+          - wg
+          - show
+          - wg0
+          - peers
+      register: local_peers
+
+    - name: Import New Peers
+      ansible.builtin.command:
+        argv:
+          - wg
+          - set
+          - wg0
+          - peer
+          - "{{ (item.value | from_json).pubkey }}"
+          - persistent-keepalive
+          - 25
+          - preshared-key
+          - /etc/wireguard/wg.psk
+          - allowed-ips
+          - "{{ (item.value | from_json).host }}"
+      loop: "{{ wg_peers }}"
+      when: (item.value | from_json).pubkey not in local_peers.stdout_lines
+  when: wg_service_status['state'] == "started"

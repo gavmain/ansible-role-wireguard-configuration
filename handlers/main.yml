@@ -1,0 +1,6 @@
+---
+# handlers file for wireguard-configuration
+- name: Restart Wireguard
+  ansible.builtin.systemd:
+    state: restarted
+    name: wg-quick@wg0.service
